@@ -30,6 +30,7 @@ arxiv_daily_agent/
 ├── graph_agent.py          # (v2.0) 基于 LangGraph 的多智能体核心工作流
 ├── requirements.txt        # 项目依赖清单
 └── .env                    # (需手动创建) 存放 API Keys 的环境变量文件
+```
 
 ##  快速开始 (Quick Start)
 ### 1. 克隆项目与安装环境
