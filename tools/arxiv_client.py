@@ -1,6 +1,9 @@
 import arxiv
 import logging
 from typing import List, Dict
+import requests
+import fitz  # PyMuPDF 的导入名
+
 
 # 配置简单的日志输出，方便调试
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,6 +47,34 @@ def fetch_latest_cv_papers(
         logging.error(f"从 ArXiv 获取数据失败: {e}")
 
     return papers
+
+def download_and_parse_pdf(pdf_url: str) -> str:
+    """
+    根据给定的 URL 下载 PDF 并提取全部纯文本。
+    """
+    # ArXiv 的 pdf_url 有时末尾没有 .pdf，我们加上以防万一
+    if not pdf_url.endswith('.pdf'):
+        pdf_url += '.pdf'
+
+    logging.info(f"📥 正在下载并解析 PDF全文: {pdf_url} (这可能需要几秒钟...)")
+    try:
+        # 发起请求下载 PDF 字节流
+        response = requests.get(pdf_url, stream=True, timeout=60)
+        response.raise_for_status()
+
+        # 使用 PyMuPDF 直接从内存中读取字节流，不写死到本地硬盘
+        doc = fitz.open(stream=response.content, filetype="pdf")
+
+        full_text = ""
+        for page in doc:
+            full_text += page.get_text("text") + "\n"
+
+        logging.info(f"✅ 解析完成！共提取 {len(full_text)} 个字符。")
+        return full_text
+
+    except Exception as e:
+        logging.error(f"❌ PDF 下载或解析失败: {e}")
+        return "未能提取到全文文本。"
 
 
 if __name__ == "__main__":
