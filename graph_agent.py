@@ -1,121 +1,292 @@
-import os
 import logging
-from typing import TypedDict, List, Dict
-from dotenv import load_dotenv
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, TypedDict
 
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
 
-from tools.arxiv_client import fetch_latest_cv_papers, download_and_parse_pdf
-from prompts.summary_prompt import detailed_tutor_prompt
+from config import APP_CONFIG
+from prompts.summary_prompt import (
+    abstract_review_prompt,
+    final_review_prompt,
+    section_summary_prompt,
+)
+from tools.arxiv_client import download_and_parse_pdf, fetch_latest_cv_papers
+from tools.llm_utils import build_chat_model, run_with_retry
+from tools.report_utils import save_report_with_archive
+from tools.text_utils import split_text_into_chunks
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-# 1. 定义整个团队共享的“状态笔记本” (State)
 class AgentState(TypedDict):
     query: str
     max_results: int
-    papers: List[Dict]  # 研究员抓取的论文
-    full_texts: List[str] # 存储每一篇论文的完整文本
-    reviews: List[str]  # 审稿人写的评价
-    final_report: str  # 主编输出的最终报告
+    papers: List[Dict]
+    full_texts: List[str]
+    chunk_summaries: List[List[str]]
+    review_sources: List[str]
+    reviews: List[str]
+    final_report: str
 
 
-# 初始化语言模型
-llm = ChatOpenAI(
-    model="glm-4-flash",  # 目前使用了智谱免费版
-    temperature=0.3,
-    base_url="https://open.bigmodel.cn/api/paas/v4/"
-)
+_llm = None
 
 
-# 2. 定义节点 1：研究员 (Researcher)
+def _get_llm():
+    global _llm
+    if _llm is None:
+        _llm = build_chat_model(APP_CONFIG)
+    return _llm
+
+
+def _pause_between_requests() -> None:
+    if APP_CONFIG.inter_request_delay > 0:
+        time.sleep(APP_CONFIG.inter_request_delay)
+
+
+def _invoke_messages(messages, operation_name: str) -> str:
+    response = run_with_retry(
+        lambda: _get_llm().invoke(messages),
+        operation_name=operation_name,
+        max_retries=APP_CONFIG.llm_max_retries,
+        base_delay=APP_CONFIG.llm_retry_base_delay,
+        max_delay=APP_CONFIG.llm_retry_max_delay,
+    )
+    return response.content.strip()
+
+
+def _build_emergency_review(paper: Dict, reason: str) -> str:
+    preview = paper["summary"][: APP_CONFIG.abstract_preview_chars]
+    if len(paper["summary"]) > APP_CONFIG.abstract_preview_chars:
+        preview += "..."
+
+    return (
+        "### 1. 论文的一句话核心\n"
+        "本次运行未能完成稳定的模型解读，下面提供基于摘要的保底信息。\n\n"
+        "### 2. 背景知识铺垫\n"
+        f"该论文主题与《{paper['title']}》相关，建议结合原文继续确认技术细节。\n\n"
+        "### 3. 当前可确认的信息\n"
+        f"- 摘要速读：{preview}\n"
+        f"- 论文链接：{paper['entry_id']}\n\n"
+        "### 4. 本次运行限制\n"
+        f"- 失败原因：{reason}\n"
+    )
+
+
+def _summarize_chunks(paper: Dict, full_text: str) -> Tuple[List[str], str]:
+    chunks = split_text_into_chunks(
+        full_text,
+        chunk_size=APP_CONFIG.reviewer_chunk_chars,
+        overlap=APP_CONFIG.reviewer_chunk_overlap,
+        max_chunks=APP_CONFIG.reviewer_max_chunks,
+    )
+    if not chunks:
+        raise ValueError("No valid chunks were produced from the PDF text.")
+
+    chunk_summaries: List[str] = []
+    total_chunks = len(chunks)
+
+    for index, chunk in enumerate(chunks, start=1):
+        messages = section_summary_prompt.format_messages(
+            title=paper["title"],
+            summary=paper["summary"],
+            chunk_index=index,
+            total_chunks=total_chunks,
+            chunk_text=chunk,
+        )
+        chunk_summary = _invoke_messages(
+            messages,
+            f"section summary for paper chunk {index}/{total_chunks}",
+        )
+        chunk_summaries.append(chunk_summary)
+        _pause_between_requests()
+
+    final_messages = final_review_prompt.format_messages(
+        title=paper["title"],
+        summary=paper["summary"],
+        chunk_summaries="\n\n".join(chunk_summaries),
+    )
+    final_review = _invoke_messages(final_messages, f"final review for {paper['title']}")
+    return chunk_summaries, final_review
+
+
+def _summarize_from_abstract(paper: Dict) -> str:
+    messages = abstract_review_prompt.format_messages(
+        title=paper["title"],
+        summary=paper["summary"],
+    )
+    return _invoke_messages(messages, f"abstract fallback review for {paper['title']}")
+
+
 def researcher_node(state: AgentState):
-    logging.info("🧑‍🔬 [研究员] 正在 ArXiv 检索最新论文...")
+    logging.info("[Researcher] Searching ArXiv and downloading paper PDFs...")
     papers = fetch_latest_cv_papers(state["query"], state["max_results"])
 
-    full_texts = []
-    # 下载全文并让大模型处理极度耗时，建议初期 max_results 设为 1
+    full_texts: List[str] = []
     for paper in papers:
-        text = download_and_parse_pdf(paper["pdf_url"])
+        text = download_and_parse_pdf(
+            paper["pdf_url"],
+            timeout=APP_CONFIG.pdf_timeout,
+            max_retries=APP_CONFIG.pdf_max_retries,
+            base_delay=APP_CONFIG.pdf_retry_base_delay,
+        )
         full_texts.append(text)
+
+        if text:
+            logging.info("[Researcher] PDF text ready for paper: %s", paper["title"])
+        else:
+            logging.warning(
+                "[Researcher] Falling back to abstract-only mode because PDF extraction failed: %s",
+                paper["title"],
+            )
 
     return {"papers": papers, "full_texts": full_texts}
 
-# 3. 定义节点 2：导师
+
 def reviewer_node(state: AgentState):
-    logging.info("👨‍🏫 [导] 正在通读全文，为您准备研一小白专属的深度讲解...")
+    logging.info("[Reviewer] Generating chunked paper reviews...")
     papers = state["papers"]
     full_texts = state["full_texts"]
-    reviews = []
 
-    # 注意：确保你的 LLM 支持长上下文（如 deepseek-chat 或 glm-4-flash）
-    for i in range(len(papers)):
-        msg = detailed_tutor_prompt.format_messages(
-            title=papers[i]["title"],
-            full_text=full_texts[i][:60000]  # 截断一下防止个别论文长得离谱，通常6万字够覆盖核心了
-        )
-        response = llm.invoke(msg)
-        reviews.append(response.content)
+    chunk_summaries: List[List[str]] = []
+    review_sources: List[str] = []
+    reviews: List[str] = []
 
-    return {"reviews": reviews}
+    for paper, full_text in zip(papers, full_texts):
+        try:
+            if full_text:
+                summaries, review = _summarize_chunks(paper, full_text)
+                chunk_summaries.append(summaries)
+                review_sources.append("全文分块解读")
+            else:
+                review = _summarize_from_abstract(paper)
+                chunk_summaries.append([])
+                review_sources.append("摘要降级模式")
 
-# 4. 定义节点 3：主编 (Editor)
+            reviews.append(review)
+            _pause_between_requests()
+        except Exception as exc:  # noqa: BLE001 - keep the workflow alive
+            logging.error("[Reviewer] Failed to process paper '%s': %s", paper["title"], exc)
+            try:
+                review = _summarize_from_abstract(paper)
+                reviews.append(review)
+                chunk_summaries.append([])
+                review_sources.append("摘要二级降级模式")
+            except Exception as fallback_exc:  # noqa: BLE001 - final safety net
+                logging.error(
+                    "[Reviewer] Abstract fallback also failed for '%s': %s",
+                    paper["title"],
+                    fallback_exc,
+                )
+                reviews.append(_build_emergency_review(paper, str(exc)))
+                chunk_summaries.append([])
+                review_sources.append("保底摘要模式")
+
+    return {
+        "chunk_summaries": chunk_summaries,
+        "review_sources": review_sources,
+        "reviews": reviews,
+    }
+
+
 def editor_node(state: AgentState):
-    logging.info("✍️ [主编] 正在汇总整理最终的学术简报...")
+    logging.info("[Editor] Building the final Markdown report...")
     papers = state["papers"]
     reviews = state["reviews"]
+    review_sources = state["review_sources"]
 
-    report = "# 🚀 目标检测每日多视角学术简报\n\n"
+    if not papers:
+        report = "# ArXiv Daily Agent Report\n\n当前没有获取到符合条件的论文。\n"
+        save_report_with_archive(
+            report,
+            latest_path=APP_CONFIG.graph_report_path,
+            archive_dir=APP_CONFIG.graph_archive_dir,
+            prefix="graph_report",
+        )
+        return {"final_report": report}
 
-    for i in range(len(papers)):
-        report += f"## {i + 1}. [{papers[i]['title']}]({papers[i]['entry_id']})\n"
-        report += f"- **作者**: {', '.join(papers[i]['authors'][:3])}\n"
-        report += f"- **摘要速读**: {papers[i]['summary'][:200]}...\n"
-        report += f"- ** 审稿人锐评**: *{reviews[i]}*\n\n---\n"
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# ArXiv Daily Agent 多智能体论文报告",
+        "",
+        f"> 生成时间：{generated_at}",
+        f"> 检索条件：`{state['query']}`",
+        f"> 处理论文数：{len(papers)}",
+        "",
+        "---",
+        "",
+    ]
 
-    # 保存到本地
-    with open("multi_agent_report.md", "w", encoding="utf-8") as f:
-        f.write(report)
+    for index, paper in enumerate(papers, start=1):
+        abstract_preview = paper["summary"][: APP_CONFIG.abstract_preview_chars]
+        if len(paper["summary"]) > APP_CONFIG.abstract_preview_chars:
+            abstract_preview += "..."
 
+        lines.extend(
+            [
+                f"## {index}. [{paper['title']}]({paper['entry_id']})",
+                f"- **作者**: {', '.join(paper['authors'][:3])}",
+                f"- **发布日期**: {paper['published_date']}",
+                f"- **解析模式**: {review_sources[index - 1]}",
+                f"- **摘要预览**: {abstract_preview}",
+                f"- **PDF**: {paper['pdf_url']}",
+                "",
+                reviews[index - 1],
+                "",
+                "---",
+                "",
+            ]
+        )
+
+    report = "\n".join(lines)
+    latest_file, archive_file = save_report_with_archive(
+        report,
+        latest_path=APP_CONFIG.graph_report_path,
+        archive_dir=APP_CONFIG.graph_archive_dir,
+        prefix="graph_report",
+    )
+    logging.info("[Editor] Latest report saved to %s", latest_file)
+    logging.info("[Editor] Archive report saved to %s", archive_file)
     return {"final_report": report}
 
 
-# 5. 构建图 (Graph) 流水线
 def build_graph():
     workflow = StateGraph(AgentState)
-
-    # 添加节点
     workflow.add_node("Researcher", researcher_node)
     workflow.add_node("Reviewer", reviewer_node)
     workflow.add_node("Editor", editor_node)
 
-    # 定义执行顺序：开始 -> 研究员 -> 审稿人 -> 主编 -> 结束
     workflow.set_entry_point("Researcher")
     workflow.add_edge("Researcher", "Reviewer")
     workflow.add_edge("Reviewer", "Editor")
     workflow.add_edge("Editor", END)
-
-    # 编译成可执行程序
     return workflow.compile()
 
 
-if __name__ == "__main__":
+def run_graph_agent(
+    query: Optional[str] = None,
+    max_results: Optional[int] = None,
+) -> str:
     app = build_graph()
-
-    # 初始化输入状态
-    initial_state = {
-        "query": 'cat:cs.CV AND "object detection"',
-        "max_results": 2,
+    initial_state: AgentState = {
+        "query": query or APP_CONFIG.arxiv_query,
+        "max_results": max_results if max_results is not None else APP_CONFIG.arxiv_max_results,
         "papers": [],
+        "full_texts": [],
+        "chunk_summaries": [],
+        "review_sources": [],
         "reviews": [],
-        "final_report": ""
+        "final_report": "",
     }
 
-    # 运行图
-    print("🎬 开始执行多智能体工作流...\n")
-    app.invoke(initial_state)
-    print("\n 多智能体协作完成！请查看 multi_agent_report.md")
+    logging.info("Starting the multi-agent workflow...")
+    result = app.invoke(initial_state)
+    logging.info("Workflow completed. Latest report is %s", APP_CONFIG.graph_report_path)
+    logging.info("Workflow archive directory is %s", APP_CONFIG.graph_archive_dir)
+    return result["final_report"]
+
+
+if __name__ == "__main__":
+    run_graph_agent()

@@ -1,16 +1,40 @@
-# 这是一个示例 Python 脚本。
+import argparse
 
-# 按 Shift+F10 执行或将其替换为您的代码。
-# 按 双击 Shift 在所有地方搜索类、文件、工具窗口、操作和设置。
-
-
-def print_hi(name):
-    # 在下面的代码行中使用断点来调试脚本。
-    print(f'Hi, {name}')  # 按 Ctrl+F8 切换断点。
+from agent import run_single_agent
+from graph_agent import run_graph_agent
 
 
-# 按间距中的绿色按钮以运行脚本。
-if __name__ == '__main__':
-    print_hi('PyCharm')
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the ArXiv Daily Agent project.")
+    parser.add_argument(
+        "--mode",
+        choices=("single", "graph"),
+        default="graph",
+        help="Choose the single-agent or multi-agent workflow.",
+    )
+    parser.add_argument(
+        "--query",
+        default=None,
+        help='Override the ArXiv query, for example: cat:cs.CV AND "object detection"',
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=None,
+        help="Override how many papers should be processed.",
+    )
+    return parser
 
-# 访问 https://www.jetbrains.com/help/pycharm/ 获取 PyCharm 帮助
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    if args.mode == "single":
+        run_single_agent(query=args.query, max_results=args.max_results)
+        return
+
+    run_graph_agent(query=args.query, max_results=args.max_results)
+
+
+if __name__ == "__main__":
+    main()

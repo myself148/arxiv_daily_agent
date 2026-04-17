@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 
 daily_report.md
+multi_agent_report.md
+archives/

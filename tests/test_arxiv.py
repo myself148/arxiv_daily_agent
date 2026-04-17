@@ -1,17 +1,25 @@
+import os
+
+import pytest
+
 from tools.arxiv_client import fetch_latest_cv_papers
 
 
+RUN_NETWORK_TESTS = os.getenv("RUN_NETWORK_TESTS") == "1"
+
+
+@pytest.mark.skipif(
+    not RUN_NETWORK_TESTS,
+    reason="Set RUN_NETWORK_TESTS=1 to run the live ArXiv integration test.",
+)
 def test_fetch_latest_cv_papers():
-    """测试论文抓取工具是否正常返回数据"""
     papers = fetch_latest_cv_papers(max_results=3)
 
-    # 断言 1：返回的列表长度必须小于等于我们请求的最大数量
     assert len(papers) <= 3
-    assert len(papers) > 0, "没有抓取到任何论文，请检查网络或 API"
+    assert len(papers) > 0, "No papers were returned from ArXiv."
 
-    # 断言 2：检查返回的数据结构是否完整
     first_paper = papers[0]
     expected_keys = ["title", "authors", "published_date", "summary", "entry_id", "pdf_url"]
     for key in expected_keys:
-        assert key in first_paper, f"论文数据缺失关键字段: {key}"
+        assert key in first_paper
         assert first_paper[key] is not None

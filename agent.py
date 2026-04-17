@@ -1,89 +1,115 @@
-import os
 import logging
-from typing import List, Dict
-from dotenv import load_dotenv
+from typing import Dict, List, Optional
 
-# 导入 LangChain 相关组件
-from langchain_openai import ChatOpenAI
-from langchain_core.output_parsers import StrOutputParser
-from langchain.agents import tool
-
-# 导入我们之前写的组件
-from tools.arxiv_client import fetch_latest_cv_papers
+from config import APP_CONFIG
 from prompts.summary_prompt import summary_prompt
+from tools.arxiv_client import fetch_latest_cv_papers
+from tools.llm_utils import build_chat_model, run_with_retry
+from tools.report_utils import save_report_with_archive
 
-# 1. 初始化配置
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-# 2. 定义 Agent 工具 (用于扩展性，如果以后想让 Agent 自己决定搜什么关键词)
-@tool
-def arxiv_search_tool(query: str, max_results: int = 5) -> List[Dict]:
-    """
-    Search ArXiv for the latest research papers.
-    Query should be in ArXiv format, e.g., 'cat:cs.CV AND "object detection"'.
-    """
-    return fetch_latest_cv_papers(query, max_results)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 class ArxivAgent:
-    def __init__(self, model_name="gpt-3.5-turbo", temperature=0.2):
-        # 初始化 LLM，可以根据需要切换到 deepseek-chat 等
-        self.llm = ChatOpenAI(
-            model="glm-4-flash",  # 使用免费版模型
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url="https://open.bigmodel.cn/api/paas/v4/"  # 智谱的 OpenAI 兼容接口
+    def __init__(self):
+        self._llm = None
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = build_chat_model(APP_CONFIG)
+        return self._llm
+
+    def _generate_summary(self, paper: Dict) -> str:
+        messages = summary_prompt.format_messages(
+            title=paper["title"],
+            date=paper["published_date"],
+            summary=paper["summary"],
+            url=paper["entry_id"],
         )
-        # 构建处理链：Prompt -> LLM -> 解析为字符串
-        self.summary_chain = summary_prompt | self.llm | StrOutputParser()
+        response = run_with_retry(
+            lambda: self.llm.invoke(messages),
+            operation_name=f"single-agent summary for {paper['title']}",
+            max_retries=APP_CONFIG.llm_max_retries,
+            base_delay=APP_CONFIG.llm_retry_base_delay,
+            max_delay=APP_CONFIG.llm_retry_max_delay,
+        )
+        return response.content.strip()
 
-    def generate_daily_report(self, query: str, max_results: int = 3):
-        logging.info("🚀 启动每日论文分析任务...")
+    def generate_daily_report(
+        self,
+        query: Optional[str] = None,
+        max_results: Optional[int] = None,
+    ) -> str:
+        logging.info("Starting the single-agent daily paper task...")
 
-        # 步骤 A: 获取论文数据
-        papers = fetch_latest_cv_papers(query, max_results)
+        papers = fetch_latest_cv_papers(
+            query or APP_CONFIG.arxiv_query,
+            max_results if max_results is not None else APP_CONFIG.arxiv_max_results,
+        )
         if not papers:
-            logging.warning("未找到相关论文。")
-            return
+            logging.warning("No papers were found for the current query.")
+            return ""
 
-        report_content = f"# 🚀 目标检测领域每日学术简报\n\n> 自动抓取自 ArXiv，由 AI 智能体提炼总结。\n\n---\n\n"
+        lines: List[str] = [
+            "# ArXiv Daily Agent 摘要日报",
+            "",
+            "> 自动抓取自 ArXiv，并由单 Agent 模式总结输出。",
+            "",
+            "---",
+            "",
+        ]
 
-        # 步骤 B: 循环处理每篇论文
-        for i, paper in enumerate(papers):
-            logging.info(f"正在处理第 {i + 1}/{len(papers)} 篇: {paper['title']}")
-
+        for index, paper in enumerate(papers, start=1):
+            logging.info("Processing paper %s/%s: %s", index, len(papers), paper["title"])
             try:
-                # 调用总结链
-                summary = self.summary_chain.invoke({
-                    "title": paper["title"],
-                    "date": paper["published_date"],
-                    "summary": paper["summary"],
-                    "url": paper["entry_id"]
-                })
+                summary = self._generate_summary(paper)
+            except Exception as exc:  # noqa: BLE001 - keep report generation alive
+                logging.error("Failed to summarize '%s': %s", paper["title"], exc)
+                abstract_preview = paper["summary"][: APP_CONFIG.abstract_preview_chars]
+                if len(paper["summary"]) > APP_CONFIG.abstract_preview_chars:
+                    abstract_preview += "..."
 
-                # 拼接 Markdown 格式
-                report_content += f"## {i + 1}. [{paper['title']}]({paper['entry_id']})\n"
-                report_content += f"- **作者**: {', '.join(paper['authors'][:3])} 等\n"
-                report_content += f"- **发布日期**: {paper['published_date']}\n\n"
-                report_content += f"{summary}\n\n"
-                report_content += f"[查看 PDF]({paper['pdf_url']})\n\n---\n\n"
+                summary = (
+                    "**核心痛点与动机**: 本次运行未能成功调用模型，建议直接阅读原始摘要。\n"
+                    f"**创新方案与架构**: {abstract_preview}\n"
+                    "**实验与效果**: 由于调用失败，本次未能稳定生成实验总结。"
+                )
 
-            except Exception as e:
-                logging.error(f"处理论文 '{paper['title']}' 时出错: {e}")
+            lines.extend(
+                [
+                    f"## {index}. [{paper['title']}]({paper['entry_id']})",
+                    f"- **作者**: {', '.join(paper['authors'][:3])}",
+                    f"- **发布日期**: {paper['published_date']}",
+                    f"- **PDF**: {paper['pdf_url']}",
+                    "",
+                    summary,
+                    "",
+                    "---",
+                    "",
+                ]
+            )
 
-        # 步骤 C: 保存报告
-        self._save_report(report_content)
+        report = "\n".join(lines)
+        latest_file, archive_file = save_report_with_archive(
+            report,
+            latest_path=APP_CONFIG.single_report_path,
+            archive_dir=APP_CONFIG.single_archive_dir,
+            prefix="single_report",
+        )
+        logging.info("Single-agent latest report saved to %s", latest_file)
+        logging.info("Single-agent archive report saved to %s", archive_file)
+        return report
 
-    def _save_report(self, content: str):
-        filename = "daily_report.md"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content)
-        logging.info(f"✅ 任务完成！报告已生成至: {filename}")
+
+def run_single_agent(
+    query: Optional[str] = None,
+    max_results: Optional[int] = None,
+) -> str:
+    agent = ArxivAgent()
+    return agent.generate_daily_report(query=query, max_results=max_results)
 
 
 if __name__ == "__main__":
-    # 实例化并运行
-    agent = ArxivAgent()
-    # 针对目标检测领域进行检索
-    agent.generate_daily_report(query='cat:cs.CV AND "object detection"', max_results=3)
+    run_single_agent()
