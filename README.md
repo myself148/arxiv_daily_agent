@@ -1,15 +1,17 @@
 # ArXiv Daily Agent
 
+当前版本：`v3`
+
 基于 `LangChain`、`LangGraph` 和 OpenAI-compatible 大模型接口构建的论文分析 Agent 项目。  
 项目会抓取 ArXiv 上最新的计算机视觉目标检测论文，支持两种工作模式：
 
 - `single`：基于摘要生成简洁日报，速度更快，成本更低
 - `graph`：基于多智能体流程执行检索、全文解析、分块总结与最终报告生成
 
-当前版本重点做了三件事：
+`v3` 重点升级了三件事：
 
-- 把模型调用、PDF 下载、文本切块等能力做成了可复用模块
-- 给网络波动、接口限流、全文解析失败增加了重试和降级逻辑
+- 强化了模型调用、PDF 下载、长文本处理的稳定性
+- 新增统一配置中心、统一命令行入口和更完整的测试
 - 新增历史归档机制，每次运行都会保留带时间戳的历史报告
 
 ## 核心能力
@@ -90,8 +92,8 @@ GRAPH_ARCHIVE_DIR=archives/graph
 
 说明：
 
-- `OPENAI_BASE_URL` 默认已经指向智谱 OpenAI-compatible 接口
-- `ARXIV_MAX_RESULTS` 默认是 `1`，这是为了减少长文本请求带来的失败概率
+- `OPENAI_BASE_URL` 默认指向智谱 OpenAI-compatible 接口
+- `ARXIV_MAX_RESULTS` 默认是 `1`，是为了降低长文本请求失败概率
 - `REVIEWER_*` 参数控制全文分块策略，适合根据模型上下文能力继续调优
 
 ## 运行方式
@@ -131,7 +133,7 @@ python main.py --mode graph --query "cat:cs.CV AND DETR" --max-results 2
 
 - 日常查看时仍然可以直接打开最新报告
 - 历史结果不会被下一次运行覆盖
-- 后续做日报回溯、对比模型效果或生成周报会更方便
+- 后续做日报回溯、效果对比或周报汇总会更方便
 
 ## 工作流说明
 
@@ -173,6 +175,12 @@ pytest -q
 set RUN_NETWORK_TESTS=1
 pytest -q
 ```
+
+## 版本说明
+
+- `v1.0`：单 Agent MVP，完成 ArXiv 摘要抓取与日报生成
+- `v2.0`：引入 LangGraph，多智能体工作流支持 PDF 全文解析
+- `v3`：强化稳定性、长文本处理、统一入口、历史归档与测试体系
 
 ## 常见问题
 
