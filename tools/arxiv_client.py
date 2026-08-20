@@ -12,7 +12,7 @@ from tools.text_utils import normalize_text
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 REQUEST_HEADERS = {
-    "User-Agent": "arxiv-daily-agent/2.0 (+https://github.com/myself148/arxiv_daily_agent)"
+    "User-Agent": "arxiv-daily-agent/4.0 (+https://github.com/myself148/arxiv_daily_agent)"
 }
 
 

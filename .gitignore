@@ -1,5 +1,13 @@
 
 .env
+.env.*
+!.env.example
+
+# Local editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
 __pycache__/
 .pytest_cache/
@@ -8,3 +16,7 @@ __pycache__/
 daily_report.md
 multi_agent_report.md
 archives/
+*.log
+
+# Local papers, run checkpoints and scheduler state
+data/

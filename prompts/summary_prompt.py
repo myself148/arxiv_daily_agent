@@ -80,7 +80,8 @@ section_summary_prompt = ChatPromptTemplate.from_messages([
 final_review_prompt = ChatPromptTemplate.from_messages([
     ("system", """你是一位拥有顶会论文经验的计算机视觉导师，现在需要为研一新生讲解一篇论文。
 你会拿到论文摘要和若干个正文片段总结，请把它们整合成一份忠于原文、结构清晰、适合初学者阅读的中文讲解。
-不要机械重复片段内容，也不要编造片段里没有支持的信息。
+你还可能拿到由检索模块召回的高相关原文片段。请优先使用这些片段补足方法、实验、消融和结论细节。
+不要机械重复片段内容，也不要编造片段或检索上下文里没有支持的信息。
 
 请严格按以下 Markdown 结构输出：
 ### 1. 论文的一句话核心
@@ -89,18 +90,19 @@ final_review_prompt = ChatPromptTemplate.from_messages([
 ### 4. 实验结论与启发"""),
     (
         "user",
-        "论文标题: {title}\n论文摘要: {summary}\n正文片段总结:\n{chunk_summaries}",
+        "论文标题: {title}\n论文摘要: {summary}\n检索增强上下文:\n{retrieved_context}\n\n正文片段总结:\n{chunk_summaries}",
     ),
 ])
 
 abstract_review_prompt = ChatPromptTemplate.from_messages([
     ("system", """你是一位计算机视觉导师，但这次只能看到论文摘要，看不到论文全文。
-请明确基于摘要进行总结，不要假装自己已经读过全文，并输出一份尽量可靠的中文讲解。
+你可能会拿到检索模块提供的少量相关上下文；如果上下文为空，请明确基于摘要进行总结。
+不要假装自己已经读过全文，也不要编造摘要或检索上下文里没有支持的信息，并输出一份尽量可靠的中文讲解。
 
 请严格按以下 Markdown 结构输出：
 ### 1. 论文的一句话核心
 ### 2. 背景知识铺垫
 ### 3. 从摘要能确认的创新点
 ### 4. 当前信息下的结论与阅读建议"""),
-    ("user", "论文标题: {title}\n论文摘要: {summary}"),
+    ("user", "论文标题: {title}\n论文摘要: {summary}\n检索增强上下文:\n{retrieved_context}"),
 ])

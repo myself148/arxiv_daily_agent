@@ -48,3 +48,19 @@ def test_save_report_with_archive_writes_latest_and_history(tmp_path: Path):
     assert latest_file.read_text(encoding="utf-8") == "# demo"
     assert archive_file.read_text(encoding="utf-8") == "# demo"
     assert archive_file.parent == archive_dir
+
+
+def test_archive_key_makes_resume_write_idempotent_archive(tmp_path: Path):
+    options = {
+        "latest_path": str(tmp_path / "latest.md"),
+        "archive_dir": str(tmp_path / "history"),
+        "prefix": "graph_report",
+        "archive_key": "run/42",
+    }
+
+    _, first_archive = save_report_with_archive("first", **options)
+    _, resumed_archive = save_report_with_archive("resumed", **options)
+
+    assert first_archive == resumed_archive
+    assert resumed_archive.name == "graph_report_run-42.md"
+    assert resumed_archive.read_text(encoding="utf-8") == "resumed"
